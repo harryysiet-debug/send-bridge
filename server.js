@@ -28,15 +28,11 @@ function extractDriveFileId(url) {
   }
 }
 
-function buildDriveDownloadUrl(fileId) {
-  return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
-}
-
-// 큰 파일 confirm 처리 포함
 async function downloadDrivePdf(fileId) {
-  const url = buildDriveDownloadUrl(fileId);
+  const baseUrl = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
 
-  const first = await axios.get(url, {
+  // 1차 요청
+  const first = await axios.get(baseUrl, {
     responseType: "arraybuffer",
     timeout: TIMEOUT_MS,
     maxRedirects: 5,
@@ -50,20 +46,24 @@ async function downloadDrivePdf(fileId) {
     ? setCookie.map(c => c.split(";")[0]).join("; ")
     : "";
 
+  // PDF면 바로 반환
   if (ct.includes("application/pdf")) {
     const buf = Buffer.from(first.data);
     if (buf.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(buf.length)}MB`);
     return buf;
   }
 
-  // confirm 토큰 파싱
-  const html = Buffer.from(first.data).toString("utf-8");
-  const confirmMatch = html.match(/confirm=([0-9A-Za-z_]+)&/);
-  if (!confirmMatch?.[1]) {
-    throw new Error(`Not PDF and confirm token not found (content-type: ${ct || "unknown"})`);
-  }
+  // 응답이 PDF가 아니면: HTML로 간주하고 토큰/경고를 파싱
+  const text = Buffer.from(first.data).toString("utf-8");
 
-  const secondUrl = `${url}&confirm=${encodeURIComponent(confirmMatch[1])}`;
+  // confirm 토큰(여러 형태 대응)
+  let confirm =
+    (text.match(/confirm=([0-9A-Za-z_]+)&/)?.[1]) ||
+    (text.match(/confirm=([0-9A-Za-z_]+)/)?.[1]);
+
+  // download_warning 쿠키가 있으면 confirm 없이도 2차 요청으로 풀리는 경우가 많음
+  // 그래도 confirm이 없으면, 쿠키만 붙여서 2차 요청을 시도해봄
+  const secondUrl = confirm ? `${baseUrl}&confirm=${encodeURIComponent(confirm)}` : baseUrl;
 
   const second = await axios.get(secondUrl, {
     responseType: "arraybuffer",
@@ -77,7 +77,10 @@ async function downloadDrivePdf(fileId) {
   });
 
   const ct2 = (second.headers["content-type"] || "").toLowerCase();
-  if (!ct2.includes("application/pdf")) throw new Error(`Confirm download still not PDF (content-type: ${ct2 || "unknown"})`);
+  if (!ct2.includes("application/pdf")) {
+    // 마지막 디버깅 정보 조금 더 주기
+    throw new Error(`Drive download still not PDF (content-type: ${ct2 || "unknown"})`);
+  }
 
   const buf2 = Buffer.from(second.data);
   if (buf2.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(buf2.length)}MB`);
@@ -161,3 +164,4 @@ app.post("/send", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`send-bridge listening on ${port}`));
+
