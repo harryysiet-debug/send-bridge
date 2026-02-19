@@ -8,10 +8,15 @@ app.use(express.json({ limit: "2mb" }));
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 20);
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 45000);
 // Railway private networking DNS 권장: SERVICE_NAME.railway.internal
-const GOTENBERG_URL = process.env.GOTENBERG_URL || "http://gotenberg.railway.internal:3000";
+const GOTENBERG_URL = process.env.GOTENBERG_URL || "http://gotenberggotenberg8.railway.internal:3000";
 
 function bytesToMB(b) {
   return Math.round((b / (1024 * 1024)) * 10) / 10;
+}
+
+function isPdfBuffer(buf) {
+  // PDF는 항상 "%PDF"로 시작
+  return buf && buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
 }
 
 function extractDriveFileId(url) {
@@ -47,11 +52,13 @@ async function downloadDrivePdf(fileId) {
     : "";
 
   // PDF면 바로 반환
-  if (ct.includes("application/pdf")) {
-    const buf = Buffer.from(first.data);
-    if (buf.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(buf.length)}MB`);
-    return buf;
-  }
+  const firstBuf = Buffer.from(first.data);
+
+// 헤더가 pdf이거나, 내용이 PDF면 통과
+if (ct.includes("application/pdf") || isPdfBuffer(firstBuf)) {
+  if (firstBuf.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(firstBuf.length)}MB`);
+  return firstBuf;
+}
 
   // 응답이 PDF가 아니면: HTML로 간주하고 토큰/경고를 파싱
   const text = Buffer.from(first.data).toString("utf-8");
@@ -76,15 +83,16 @@ async function downloadDrivePdf(fileId) {
     }
   });
 
-  const ct2 = (second.headers["content-type"] || "").toLowerCase();
-  if (!ct2.includes("application/pdf")) {
-    // 마지막 디버깅 정보 조금 더 주기
-    throw new Error(`Drive download still not PDF (content-type: ${ct2 || "unknown"})`);
-  }
+const ct2 = (second.headers["content-type"] || "").toLowerCase();
+const buf2 = Buffer.from(second.data);
 
-  const buf2 = Buffer.from(second.data);
-  if (buf2.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(buf2.length)}MB`);
-  return buf2;
+// 헤더가 pdf이거나, 내용이 PDF면 통과
+if (!(ct2.includes("application/pdf") || isPdfBuffer(buf2))) {
+  throw new Error(`Drive download still not PDF (content-type: ${ct2 || "unknown"})`);
+}
+
+if (buf2.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(buf2.length)}MB`);
+return buf2;
 }
 
 async function mergeWithGotenberg(buffers) {
@@ -164,4 +172,5 @@ app.post("/send", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`send-bridge listening on ${port}`));
+
 
