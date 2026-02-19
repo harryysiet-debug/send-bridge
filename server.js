@@ -118,21 +118,26 @@ async function sendBrevoEmail({ toEmail, subject, html, attachmentName, attachme
   const payload = {
     sender: {
       email: process.env.BREVO_SENDER_EMAIL,
-      name: process.env.BREVO_SENDER_NAME || "Sender"
+      name: process.env.BREVO_SENDER_NAME || "Sender",
     },
     to: [{ email: toEmail }],
     subject,
     htmlContent: html,
-    attachment: [{ name: attachmentName, content: attachmentB64 }]
+    attachment: [{ name: attachmentName, content: attachmentB64 }],
   };
 
-  const resp = await axios.post("https://api.brevo.com/v3/smtp/email", payload, {
-    headers: { "api-key": apiKey, "content-type": "application/json" },
-    timeout: TIMEOUT_MS,
-    validateStatus: (s) => s >= 200 && s < 300
-  });
-
-  return resp.data;
+  try {
+    const resp = await axios.post("https://api.brevo.com/v3/smtp/email", payload, {
+      headers: { "api-key": apiKey, "content-type": "application/json" },
+      timeout: TIMEOUT_MS,
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
+    return resp.data;
+  } catch (err) {
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    throw new Error(`Brevo error ${status}: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+  }
 }
 
 app.get("/health", (_, res) => res.status(200).send("ok"));
@@ -172,5 +177,6 @@ app.post("/send", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`send-bridge listening on ${port}`));
+
 
 
