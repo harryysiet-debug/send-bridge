@@ -1,6 +1,7 @@
 import express from "express";
 import axios from "axios";
 import FormData from "form-data";
+import { google } from "googleapis";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -31,94 +32,47 @@ function extractDriveFileId(url) {
   }
 }
 
-const DRIVE_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-  "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-  "Sec-Ch-Ua-Mobile": "?0",
-  "Sec-Ch-Ua-Platform": '"Windows"',
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Sec-Fetch-User": "?1",
-  "Upgrade-Insecure-Requests": "1",
-  "Referer": "https://drive.google.com/"
-};
+// --------- Drive API (서비스 계정 인증) ---------
+let _driveClient = null;
+function getDriveClient() {
+  if (_driveClient) return _driveClient;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON env variable");
 
-async function downloadDrivePdf(fileId) {
-  // 새 endpoint + confirm=t (100MB+ 경고도 우회)
-  const primaryUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+  let credentials;
+  try {
+    credentials = JSON.parse(raw);
+  } catch (e) {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON");
+  }
 
-  const first = await axios.get(primaryUrl, {
-    responseType: "arraybuffer",
-    timeout: TIMEOUT_MS,
-    maxRedirects: 5,
-    validateStatus: (s) => s >= 200 && s < 400,
-    headers: DRIVE_HEADERS
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/drive.readonly"]
   });
-
-  const ct = (first.headers["content-type"] || "").toLowerCase();
-  const setCookie = first.headers["set-cookie"] || [];
-  const cookieHeader = Array.isArray(setCookie)
-    ? setCookie.map(c => c.split(";")[0]).join("; ")
-    : "";
-
-  const firstBuf = Buffer.from(first.data);
-
-  // PDF면 바로 반환
-  if (ct.includes("application/pdf") || isPdfBuffer(firstBuf)) {
-    if (firstBuf.length > MAX_FILE_MB * 1024 * 1024) {
-      throw new Error(`PDF too large: ${bytesToMB(firstBuf.length)}MB`);
-    }
-    return firstBuf;
-  }
-
-  // HTML이면 form에서 confirm + uuid 추출
-  const text = firstBuf.toString("utf-8");
-
-  const confirm =
-    text.match(/name="confirm"\s+value="([^"]+)"/)?.[1] ||
-    text.match(/confirm=([0-9A-Za-z_-]+)/)?.[1];
-
-  const uuid = text.match(/name="uuid"\s+value="([^"]+)"/)?.[1];
-
-  if (!confirm) {
-    const preview = text.slice(0, 400).replace(/\s+/g, " ");
-    throw new Error(`Drive returned HTML, no confirm token (ct: ${ct}) | preview: ${preview}`);
-  }
-
-  const params = new URLSearchParams({ id: fileId, export: "download", confirm });
-  if (uuid) params.set("uuid", uuid);
-
-  const secondUrl = `https://drive.usercontent.google.com/download?${params.toString()}`;
-
-  const second = await axios.get(secondUrl, {
-    responseType: "arraybuffer",
-    timeout: TIMEOUT_MS,
-    maxRedirects: 5,
-    validateStatus: (s) => s >= 200 && s < 400,
-    headers: {
-      ...DRIVE_HEADERS,
-      ...(cookieHeader ? { Cookie: cookieHeader } : {})
-    }
-  });
-
-  const ct2 = (second.headers["content-type"] || "").toLowerCase();
-  const buf2 = Buffer.from(second.data);
-
-  if (!(ct2.includes("application/pdf") || isPdfBuffer(buf2))) {
-    const preview = buf2.toString("utf-8").slice(0, 400).replace(/\s+/g, " ");
-    throw new Error(`Drive download still not PDF (content-type: ${ct2 || "unknown"}) | preview: ${preview}`);
-  }
-
-  if (buf2.length > MAX_FILE_MB * 1024 * 1024) {
-    throw new Error(`PDF too large: ${bytesToMB(buf2.length)}MB`);
-  }
-  return buf2;
+  _driveClient = google.drive({ version: "v3", auth });
+  return _driveClient;
 }
 
-// 간헐적 실패 대응: 최대 2회 자동 재시도
+async function downloadDrivePdf(fileId) {
+  const drive = getDriveClient();
+
+  const response = await drive.files.get(
+    { fileId, alt: "media", supportsAllDrives: true },
+    { responseType: "arraybuffer", timeout: TIMEOUT_MS }
+  );
+
+  const buf = Buffer.from(response.data);
+
+  if (!isPdfBuffer(buf)) {
+    throw new Error(`Drive file is not a PDF (size: ${bytesToMB(buf.length)}MB)`);
+  }
+  if (buf.length > MAX_FILE_MB * 1024 * 1024) {
+    throw new Error(`PDF too large: ${bytesToMB(buf.length)}MB`);
+  }
+  return buf;
+}
+
 async function downloadDrivePdfWithRetry(fileId, maxRetries = 2) {
   let lastErr;
   for (let i = 0; i <= maxRetries; i++) {
@@ -134,6 +88,7 @@ async function downloadDrivePdfWithRetry(fileId, maxRetries = 2) {
   throw lastErr;
 }
 
+// --------- Gotenberg PDF 합치기 ---------
 async function mergeWithGotenberg(buffers) {
   const form = new FormData();
   buffers.forEach((buf, idx) => {
@@ -150,6 +105,7 @@ async function mergeWithGotenberg(buffers) {
   return Buffer.from(resp.data);
 }
 
+// --------- Brevo 이메일 발송 ---------
 async function sendBrevoEmail({ toEmail, subject, html, attachmentName, attachmentB64 }) {
   const apiKey = process.env.BREVO_API_KEY;
   if (!apiKey) throw new Error("Missing BREVO_API_KEY");
@@ -179,6 +135,7 @@ async function sendBrevoEmail({ toEmail, subject, html, attachmentName, attachme
   }
 }
 
+// --------- Routes ---------
 app.get("/health", (_, res) => res.status(200).send("ok"));
 
 app.post("/send", async (req, res) => {
