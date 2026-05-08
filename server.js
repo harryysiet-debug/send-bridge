@@ -7,7 +7,6 @@ app.use(express.json({ limit: "2mb" }));
 
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 20);
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 45000);
-// Railway private networking DNS 권장: SERVICE_NAME.railway.internal
 const GOTENBERG_URL = process.env.GOTENBERG_URL || "http://gotenberggotenberg8.railway.internal:3000";
 
 function bytesToMB(b) {
@@ -15,7 +14,6 @@ function bytesToMB(b) {
 }
 
 function isPdfBuffer(buf) {
-  // PDF는 항상 "%PDF"로 시작
   return buf && buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
 }
 
@@ -33,16 +31,21 @@ function extractDriveFileId(url) {
   }
 }
 
-async function downloadDrivePdf(fileId) {
-  const baseUrl = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`;
+const DRIVE_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "*/*"
+};
 
-  // 1차 요청
-  const first = await axios.get(baseUrl, {
+async function downloadDrivePdf(fileId) {
+  // 새 endpoint + confirm=t (100MB+ 경고도 우회)
+  const primaryUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+
+  const first = await axios.get(primaryUrl, {
     responseType: "arraybuffer",
     timeout: TIMEOUT_MS,
     maxRedirects: 5,
     validateStatus: (s) => s >= 200 && s < 400,
-    headers: { "User-Agent": "Mozilla/5.0" }
+    headers: DRIVE_HEADERS
   });
 
   const ct = (first.headers["content-type"] || "").toLowerCase();
@@ -51,26 +54,34 @@ async function downloadDrivePdf(fileId) {
     ? setCookie.map(c => c.split(";")[0]).join("; ")
     : "";
 
-  // PDF면 바로 반환
   const firstBuf = Buffer.from(first.data);
 
-// 헤더가 pdf이거나, 내용이 PDF면 통과
-if (ct.includes("application/pdf") || isPdfBuffer(firstBuf)) {
-  if (firstBuf.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(firstBuf.length)}MB`);
-  return firstBuf;
-}
+  // PDF면 바로 반환
+  if (ct.includes("application/pdf") || isPdfBuffer(firstBuf)) {
+    if (firstBuf.length > MAX_FILE_MB * 1024 * 1024) {
+      throw new Error(`PDF too large: ${bytesToMB(firstBuf.length)}MB`);
+    }
+    return firstBuf;
+  }
 
-  // 응답이 PDF가 아니면: HTML로 간주하고 토큰/경고를 파싱
-  const text = Buffer.from(first.data).toString("utf-8");
+  // HTML이면 form에서 confirm + uuid 추출
+  const text = firstBuf.toString("utf-8");
 
-  // confirm 토큰(여러 형태 대응)
-  let confirm =
-    (text.match(/confirm=([0-9A-Za-z_]+)&/)?.[1]) ||
-    (text.match(/confirm=([0-9A-Za-z_]+)/)?.[1]);
+  const confirm =
+    text.match(/name="confirm"\s+value="([^"]+)"/)?.[1] ||
+    text.match(/confirm=([0-9A-Za-z_-]+)/)?.[1];
 
-  // download_warning 쿠키가 있으면 confirm 없이도 2차 요청으로 풀리는 경우가 많음
-  // 그래도 confirm이 없으면, 쿠키만 붙여서 2차 요청을 시도해봄
-  const secondUrl = confirm ? `${baseUrl}&confirm=${encodeURIComponent(confirm)}` : baseUrl;
+  const uuid = text.match(/name="uuid"\s+value="([^"]+)"/)?.[1];
+
+  if (!confirm) {
+    const preview = text.slice(0, 400).replace(/\s+/g, " ");
+    throw new Error(`Drive returned HTML, no confirm token (ct: ${ct}) | preview: ${preview}`);
+  }
+
+  const params = new URLSearchParams({ id: fileId, export: "download", confirm });
+  if (uuid) params.set("uuid", uuid);
+
+  const secondUrl = `https://drive.usercontent.google.com/download?${params.toString()}`;
 
   const second = await axios.get(secondUrl, {
     responseType: "arraybuffer",
@@ -78,21 +89,39 @@ if (ct.includes("application/pdf") || isPdfBuffer(firstBuf)) {
     maxRedirects: 5,
     validateStatus: (s) => s >= 200 && s < 400,
     headers: {
-      "User-Agent": "Mozilla/5.0",
+      ...DRIVE_HEADERS,
       ...(cookieHeader ? { Cookie: cookieHeader } : {})
     }
   });
 
-const ct2 = (second.headers["content-type"] || "").toLowerCase();
-const buf2 = Buffer.from(second.data);
+  const ct2 = (second.headers["content-type"] || "").toLowerCase();
+  const buf2 = Buffer.from(second.data);
 
-// 헤더가 pdf이거나, 내용이 PDF면 통과
-if (!(ct2.includes("application/pdf") || isPdfBuffer(buf2))) {
-  throw new Error(`Drive download still not PDF (content-type: ${ct2 || "unknown"})`);
+  if (!(ct2.includes("application/pdf") || isPdfBuffer(buf2))) {
+    const preview = buf2.toString("utf-8").slice(0, 400).replace(/\s+/g, " ");
+    throw new Error(`Drive download still not PDF (content-type: ${ct2 || "unknown"}) | preview: ${preview}`);
+  }
+
+  if (buf2.length > MAX_FILE_MB * 1024 * 1024) {
+    throw new Error(`PDF too large: ${bytesToMB(buf2.length)}MB`);
+  }
+  return buf2;
 }
 
-if (buf2.length > MAX_FILE_MB * 1024 * 1024) throw new Error(`PDF too large: ${bytesToMB(buf2.length)}MB`);
-return buf2;
+// 간헐적 실패 대응: 최대 2회 자동 재시도
+async function downloadDrivePdfWithRetry(fileId, maxRetries = 2) {
+  let lastErr;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      return await downloadDrivePdf(fileId);
+    } catch (e) {
+      lastErr = e;
+      if (i < maxRetries) {
+        await new Promise(r => setTimeout(r, 1000 * (i + 1))); // 1s, 2s 백오프
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function mergeWithGotenberg(buffers) {
@@ -155,7 +184,10 @@ app.post("/send", async (req, res) => {
       return res.status(400).json({ ok: false, message: "Could not extract Drive fileId", detail: { id1, id2 } });
     }
 
-    const [pdf1, pdf2] = await Promise.all([downloadDrivePdf(id1), downloadDrivePdf(id2)]);
+    const [pdf1, pdf2] = await Promise.all([
+      downloadDrivePdfWithRetry(id1),
+      downloadDrivePdfWithRetry(id2)
+    ]);
     const merged = await mergeWithGotenberg([pdf1, pdf2]);
 
     const b64 = merged.toString("base64");
@@ -177,6 +209,3 @@ app.post("/send", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`send-bridge listening on ${port}`));
-
-
-
